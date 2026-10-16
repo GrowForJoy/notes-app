@@ -29,6 +29,7 @@ function cacheDom() {
     'newNoteBtn', 'themeBtn', 'settingsBtn', 'noteCount', 'noteList', 'refreshBtn',
     'reader', 'noteTitle', 'noteMeta', 'markdownBody', 'editBtn', 'deleteBtn',
     'editor', 'editorPath', 'editorBody', 'cancelEditBtn', 'saveBtn',
+    'toolbar', 'editorPanes', 'editorPreview', 'previewToggleBtn', 'editorStat', 'imageInput',
     'emptyState', 'emptySetupBtn', 'scrim', 'settingsModal', 'closeSettingsBtn',
     'cfgOwner', 'cfgRepo', 'cfgToken', 'cfgBranch', 'cfgError',
     'testConnBtn', 'clearCfgBtn', 'saveCfgBtn', 'toast', 'main',
@@ -50,14 +51,18 @@ function encodePath(p) {
   return p.split('/').map(encodeURIComponent).join('/');
 }
 
-function textToB64(str) {
-  const bytes = new TextEncoder().encode(str);
+/** Uint8Array → base64；图片这类二进制内容也走这里 */
+function bytesToB64(bytes) {
   let bin = '';
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) {
     bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
   return btoa(bin);
+}
+
+function textToB64(str) {
+  return bytesToB64(new TextEncoder().encode(str));
 }
 
 function debounce(fn, ms) {
@@ -321,6 +326,27 @@ function renderList() {
 
 /* --------------------------------------------------------------- 阅读视图 */
 
+/* 让 Markdown 支持 ==高亮== 语法 */
+function setupMarked() {
+  if (!window.marked) return;
+  marked.use({
+    extensions: [{
+      name: 'mark',
+      level: 'inline',
+      start(src) { return src.indexOf('=='); },
+      tokenizer(src) {
+        const m = /^==(?!=)([\s\S]+?)==/.exec(src);
+        if (!m) return undefined;
+        const body = m[1].trim();
+        return { type: 'mark', raw: m[0], text: body, tokens: this.lexer.inlineTokens(body) };
+      },
+      renderer(token) {
+        return '<mark>' + this.parser.parseInline(token.tokens) + '</mark>';
+      }
+    }]
+  });
+}
+
 function renderMarkdown(text) {
   if (window.marked && window.DOMPurify) {
     marked.setOptions({ gfm: true, breaks: true });
@@ -329,8 +355,9 @@ function renderMarkdown(text) {
   return '<pre>' + escapeHtml(text || '') + '</pre>';
 }
 
-function enhanceCodeBlocks() {
-  els.markdownBody.querySelectorAll('pre').forEach(pre => {
+function enhanceCodeBlocks(root) {
+  const scope = root || els.markdownBody;
+  scope.querySelectorAll('pre').forEach(pre => {
     if (pre.querySelector('.code-copy')) return;
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -350,10 +377,70 @@ function enhanceCodeBlocks() {
   });
 
   if (window.hljs) {
-    els.markdownBody.querySelectorAll('pre code').forEach(el => {
+    scope.querySelectorAll('pre code').forEach(el => {
       try { hljs.highlightElement(el); } catch (e) { /* 忽略单块失败 */ }
     });
   }
+}
+
+/* 私有仓库里的图片带不上 Authorization 头，必须先取回字节再换成临时地址 */
+const imageUrls = new Map();
+
+/** 把 Markdown 里的相对图片路径解析成仓库内路径；外链图片返回 null */
+function resolveImagePath(src, notePath) {
+  if (!src || /^(?:https?:|data:|blob:|\/\/)/i.test(src)) return null;
+
+  const clean = src.split('#')[0].split('?')[0];
+  let decoded = clean;
+  try { decoded = decodeURIComponent(clean); } catch (e) { /* 解不开就按原样用 */ }
+
+  const dir = notePath && notePath.includes('/')
+    ? notePath.slice(0, notePath.lastIndexOf('/'))
+    : '';
+  const segments = (dir ? dir.split('/') : []).concat(decoded.split('/'));
+
+  const out = [];
+  for (const seg of segments) {
+    if (seg === '..') out.pop();
+    else if (seg !== '.' && seg !== '') out.push(seg);
+  }
+  return out.join('/');
+}
+
+async function enhanceImages(root, notePath) {
+  const list = root.querySelectorAll('img');
+  await Promise.all([...list].map(async img => {
+    const repoPath = resolveImagePath(img.getAttribute('src'), notePath);
+    if (!repoPath) return;   /* 外链图片交给浏览器自己加载 */
+
+    img.classList.add('is-loading');
+    try {
+      let url = imageUrls.get(repoPath);
+      if (!url) {
+        const res = await fetch(
+          API + `/repos/${cfg.owner}/${cfg.repo}/contents/${encodePath(repoPath)}`
+            + (cfg.branch ? '?ref=' + encodeURIComponent(cfg.branch) : ''),
+          {
+            headers: {
+              Accept: 'application/vnd.github.raw',
+              Authorization: 'Bearer ' + cfg.token,
+              'X-GitHub-Api-Version': '2022-11-28'
+            }
+          }
+        );
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        url = URL.createObjectURL(await res.blob());
+        imageUrls.set(repoPath, url);
+      }
+      img.src = url;
+    } catch (e) {
+      img.removeAttribute('src');
+      img.classList.add('is-broken');
+      img.alt = '图片读不到：' + repoPath;
+    } finally {
+      img.classList.remove('is-loading');
+    }
+  }));
 }
 
 function selectNote(path) {
@@ -369,6 +456,7 @@ function selectNote(path) {
   els.noteMeta.textContent = n.path + ' · ' + (n.text || '').length + ' 字符';
   els.markdownBody.innerHTML = renderMarkdown(n.text);
   enhanceCodeBlocks();
+  enhanceImages(els.markdownBody, n.path);
   els.main.scrollTop = 0;
   document.title = (n.title || n.path) + ' · 学习笔记';
 
@@ -419,6 +507,276 @@ function clearDraft() {
   localStorage.removeItem(DRAFT_KEY);
 }
 
+/* --------------------------------------------------------- 编辑区工具条 */
+
+/** 取当前选区覆盖到的整行 */
+function selectedLines() {
+  const ta = els.editorBody;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const from = value.lastIndexOf('\n', start - 1) + 1;
+  let to = value.indexOf('\n', end);
+  if (to === -1) to = value.length;
+
+  const lines = value.slice(from, to).split('\n');
+  const apply = nextLines => {
+    const text = nextLines.join('\n');
+    ta.value = value.slice(0, from) + text + value.slice(to);
+    ta.setSelectionRange(from, from + text.length);
+    ta.focus();
+    onEditorChanged();
+  };
+  return { lines, apply };
+}
+
+/** 用标记包住选区；如果已经在标记里面，再点一次就取消包裹 */
+function wrapSelection(before, after, placeholder) {
+  const ta = els.editorBody;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+
+  const outerBefore = value.slice(Math.max(0, start - before.length), start);
+  const outerAfter = value.slice(end, end + after.length);
+
+  if (outerBefore === before && outerAfter === after) {
+    ta.value = value.slice(0, start - before.length) + value.slice(start, end) + value.slice(end + after.length);
+    ta.focus();
+    ta.setSelectionRange(start - before.length, end - before.length);
+    onEditorChanged();
+    return;
+  }
+
+  const picked = value.slice(start, end) || placeholder || '';
+  ta.value = value.slice(0, start) + before + picked + after + value.slice(end);
+  ta.focus();
+  ta.setSelectionRange(start + before.length, start + before.length + picked.length);
+  onEditorChanged();
+}
+
+function toggleHeading(level) {
+  const prefix = '#'.repeat(level) + ' ';
+  const { lines, apply } = selectedLines();
+  const all = lines.every(l => l.trimStart().startsWith(prefix));
+  apply(lines.map(l => {
+    const bare = l.replace(/^\s*#{1,6}\s+/, '');
+    return all ? bare : prefix + bare;
+  }));
+}
+
+function toggleList(ordered) {
+  const { lines, apply } = selectedLines();
+  const re = /^\s*(?:[-*+]|\d+\.)\s+/;
+  const all = lines.every(l => re.test(l));
+  let n = 0;
+  apply(lines.map(l => {
+    const bare = l.replace(re, '');
+    if (all) return bare;
+    if (ordered) { n += 1; return n + '. ' + bare; }
+    return '- ' + bare;
+  }));
+}
+
+function toggleQuote() {
+  const { lines, apply } = selectedLines();
+  const re = /^\s*>\s?/;
+  const all = lines.every(l => re.test(l));
+  apply(lines.map(l => (all ? l.replace(re, '') : '> ' + l.replace(re, ''))));
+}
+
+/** 在光标处插入块级内容，必要时前后补换行 */
+function insertBlock(text, selFrom, selTo) {
+  const ta = els.editorBody;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+
+  const lead = (before && !before.endsWith('\n')) ? '\n' : '';
+  const trail = (after && !after.startsWith('\n')) ? '\n' : '';
+
+  ta.value = before + lead + text + trail + after;
+  ta.focus();
+  const base = start + lead.length;
+  ta.setSelectionRange(base + (selFrom || 0), base + (selTo === undefined ? (selFrom || 0) : selTo));
+  onEditorChanged();
+}
+
+/** 插入 C# 代码块；有选中内容就包起来 */
+function insertCodeBlock() {
+  const ta = els.editorBody;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const picked = value.slice(start, end);
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+
+  const head = '```cs\n';
+  const tail = '\n```';
+  const lead = (before && !before.endsWith('\n')) ? '\n' : '';
+  const trail = (after && !after.startsWith('\n')) ? '\n' : '';
+
+  ta.value = before + lead + head + picked + tail + trail + after;
+  ta.focus();
+  const bodyStart = start + lead.length + head.length;
+  ta.setSelectionRange(bodyStart, bodyStart + picked.length);
+  onEditorChanged();
+}
+
+/* -------------------------------------------------------------- 图片上传 */
+
+const IMAGE_DIR = 'assets';
+
+/** 生成不会撞名的图片文件名，同时保留原名字里能读的部分 */
+function safeImageName(original) {
+  const hit = /\.(png|jpe?g|gif|webp|bmp|svg)$/i.exec(original || '');
+  const ext = hit ? hit[0].toLowerCase() : '.png';
+  const base = (original || '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^\w\u4e00-\u9fa5-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24) || 'image';
+
+  const d = new Date();
+  const two = n => String(n).padStart(2, '0');
+  const stamp = '' + d.getFullYear() + two(d.getMonth() + 1) + two(d.getDate())
+    + '-' + two(d.getHours()) + two(d.getMinutes()) + two(d.getSeconds());
+
+  return base + '-' + stamp + ext;
+}
+
+/** 按笔记所在的层级算出相对写法，这样在 GitHub 网页里也能正常显示 */
+function imageMarkdown(repoPath, alt) {
+  const notePath = (els.editorPath.value || '').trim();
+  const depth = notePath.includes('/')
+    ? notePath.slice(0, notePath.lastIndexOf('/')).split('/').length
+    : 0;
+  return '![' + (alt || '图片') + '](' + '../'.repeat(depth) + repoPath + ')';
+}
+
+async function saveImage(file) {
+  if (!hasConfig()) { toast('先点右上角 ⚙ 填好设置，才能把图片存进仓库'); return; }
+  if (!/^image\//i.test(file.type || '')) { toast('只能上传图片文件'); return; }
+  if (file.size > 4 * 1024 * 1024) {
+    toast('图片超过 4MB，先压缩一下再传（截图一般远小于这个值）');
+    return;
+  }
+
+  const repoPath = IMAGE_DIR + '/' + safeImageName(file.name);
+  const alt = (file.name || '').replace(/\.[^.]+$/, '') || '图片';
+
+  setStatus('busy', '上传图片');
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await gh(
+      `/repos/${cfg.owner}/${cfg.repo}/contents/${encodePath(repoPath)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: '新增图片：' + repoPath,
+          content: bytesToB64(bytes),
+          branch: cfg.branch || undefined
+        })
+      }
+    );
+    insertBlock(imageMarkdown(repoPath, alt));
+    setStatus('ok', '图片已上传');
+    toast('图片已存进仓库：' + repoPath);
+  } catch (err) {
+    setStatus('error', '上传失败');
+    toast(err.message || '图片上传失败');
+  }
+}
+
+function pickImage() {
+  if (!hasConfig()) { toast('先点右上角 ⚙ 填好设置，才能把图片存进仓库'); return; }
+  els.imageInput.value = '';
+  els.imageInput.click();
+}
+
+const TABLE_SNIPPET = '| 概念 | 说明 |\n| --- | --- |\n| 示例 | 示例 |';
+
+function applyToolAction(act) {
+  switch (act) {
+    case 'h1': toggleHeading(1); break;
+    case 'h2': toggleHeading(2); break;
+    case 'h3': toggleHeading(3); break;
+    case 'bold': wrapSelection('**', '**', '粗体'); break;
+    case 'italic': wrapSelection('*', '*', '斜体'); break;
+    case 'mark': wrapSelection('==', '==', '高亮'); break;
+    case 'strike': wrapSelection('~~', '~~', '删除线'); break;
+    case 'ul': toggleList(false); break;
+    case 'ol': toggleList(true); break;
+    case 'quote': toggleQuote(); break;
+    case 'code': wrapSelection('`', '`', '代码'); break;
+    case 'codeblock': insertCodeBlock(); break;
+    case 'link': wrapSelection('[', '](https://)', '链接文字'); break;
+    case 'image': pickImage(); break;
+    case 'table': insertBlock(TABLE_SNIPPET, 2, 4); break;
+    case 'hr': insertBlock('---\n'); break;
+  }
+}
+
+/** Tab 缩进，Shift + Tab 反缩进 */
+function handleEditorTab(e) {
+  if (e.key !== 'Tab') return;
+  e.preventDefault();
+
+  const ta = els.editorBody;
+  const value = ta.value;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+
+  if (start === end && !e.shiftKey) {
+    ta.value = value.slice(0, start) + '  ' + value.slice(end);
+    ta.setSelectionRange(start + 2, start + 2);
+  } else {
+    const from = value.lastIndexOf('\n', start - 1) + 1;
+    let to = value.indexOf('\n', end);
+    if (to === -1) to = value.length;
+    const text = value.slice(from, to).split('\n')
+      .map(l => (e.shiftKey ? l.replace(/^ {1,2}/, '') : '  ' + l))
+      .join('\n');
+    ta.value = value.slice(0, from) + text + value.slice(to);
+    ta.setSelectionRange(from, from + text.length);
+  }
+  ta.focus();
+  onEditorChanged();
+}
+
+/* 实时预览与字数统计 */
+function paintEditorPreview() {
+  if (!els.editorPanes.classList.contains('is-preview')) return;
+  els.editorPreview.innerHTML = renderMarkdown(els.editorBody.value);
+  enhanceCodeBlocks(els.editorPreview);
+  enhanceImages(els.editorPreview, (els.editorPath.value || '').trim());
+}
+
+const paintEditorPreviewLater = debounce(paintEditorPreview, 180);
+
+function updateEditorStat() {
+  const text = els.editorBody.value;
+  const lines = text ? text.split('\n').length : 0;
+  els.editorStat.textContent = text.length + ' 字符 · ' + lines + ' 行';
+}
+
+function onEditorChanged() {
+  scheduleDraft();
+  updateEditorStat();
+  paintEditorPreviewLater();
+}
+
+function togglePreview() {
+  const on = els.editorPanes.classList.toggle('is-preview');
+  els.previewToggleBtn.classList.toggle('is-on', on);
+  els.previewToggleBtn.textContent = on ? '关闭预览' : '预览';
+  if (on) paintEditorPreview();
+}
+
 function openNewNote() {
   if (!hasConfig()) { openSettings(); return; }
 
@@ -435,6 +793,8 @@ function openNewNote() {
   els.main.scrollTop = 0;
   (els.editorPath.value ? els.editorBody : els.editorPath).focus();
   if (restore) toast('已恢复上次没写完的草稿');
+  updateEditorStat();
+  paintEditorPreview();
 }
 
 function editCurrentNote() {
@@ -449,6 +809,8 @@ function editCurrentNote() {
   els.editorBody.value = n.text || '';
   els.main.scrollTop = 0;
   els.editorBody.focus();
+  updateEditorStat();
+  paintEditorPreview();
 }
 
 function cancelEdit() {
@@ -739,8 +1101,36 @@ function bindEvents() {
   els.cancelEditBtn.addEventListener('click', cancelEdit);
   els.saveBtn.addEventListener('click', saveNote);
 
-  els.editorBody.addEventListener('input', scheduleDraft);
+  els.editorBody.addEventListener('input', onEditorChanged);
   els.editorPath.addEventListener('input', scheduleDraft);
+  els.editorBody.addEventListener('keydown', handleEditorTab);
+
+  els.toolbar.addEventListener('mousedown', e => {
+    /* 阻止按钮抢走输入框焦点，否则选区会被清掉 */
+    if (e.target.closest('.tool-btn')) e.preventDefault();
+  });
+  els.toolbar.addEventListener('click', e => {
+    const btn = e.target.closest('.tool-btn');
+    if (btn) applyToolAction(btn.dataset.act);
+  });
+  els.previewToggleBtn.addEventListener('click', togglePreview);
+
+  els.imageInput.addEventListener('change', e => {
+    const file = e.target.files && e.target.files[0];
+    if (file) saveImage(file);
+  });
+
+  /* 截图直接粘贴：Win + Shift + S 截完，回到编辑器 Ctrl + V */
+  els.editorBody.addEventListener('paste', e => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type && item.type.indexOf('image/') === 0) {
+        const file = item.getAsFile();
+        if (file) { e.preventDefault(); saveImage(file); return; }
+      }
+    }
+  });
 
   els.refreshBtn.addEventListener('click', () => loadNotes());
   els.searchInput.addEventListener('input', debounce(e => {
@@ -753,10 +1143,23 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && !els.editor.hidden) {
+    const inEditor = !els.editor.hidden;
+    const mod = e.ctrlKey || e.metaKey;
+    const key = e.key.toLowerCase();
+
+    if (inEditor && mod && key === 's') {
       e.preventDefault();
       saveNote();
     }
+
+    if (inEditor && mod && !e.altKey) {
+      if (e.shiftKey && key === 'h') { e.preventDefault(); wrapSelection('==', '==', '高亮'); }
+      else if (!e.shiftKey && key === 'b') { e.preventDefault(); wrapSelection('**', '**', '粗体'); }
+      else if (!e.shiftKey && key === 'i') { e.preventDefault(); wrapSelection('*', '*', '斜体'); }
+      else if (!e.shiftKey && key === 'e') { e.preventDefault(); wrapSelection('`', '`', '代码'); }
+      else if (!e.shiftKey && key === 'k') { e.preventDefault(); wrapSelection('[', '](https://)', '链接文字'); }
+    }
+
     if (e.key === 'Escape') {
       if (!els.settingsModal.hidden) closeSettings();
       else closeDrawer();
@@ -772,6 +1175,7 @@ function bindEvents() {
 
 function init() {
   cacheDom();
+  setupMarked();
   loadConfig();
   loadCache();
 

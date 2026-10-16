@@ -71,12 +71,45 @@
         <div class="editor-head">
           <input id="editorPath" class="path-input" placeholder="笔记路径，例如 CSharp/基础语法.md" spellcheck="false">
           <div class="actions">
+            <button class="ghost-btn" id="previewToggleBtn" title="实时预览（并排显示渲染结果）">预览</button>
             <button class="ghost-btn" id="cancelEditBtn">取消</button>
             <button class="primary-btn" id="saveBtn">保存</button>
           </div>
         </div>
-        <textarea id="editorBody" class="editor-body" spellcheck="false" placeholder="用 Markdown 写笔记，代码块用 ```cs 包起来就会高亮"></textarea>
-        <div class="editor-hint">Ctrl + S 保存 · 内容会自动存为草稿</div>
+
+        <div class="toolbar" id="toolbar">
+          <button type="button" class="tool-btn" data-act="h1" title="一级标题">H1</button>
+          <button type="button" class="tool-btn" data-act="h2" title="二级标题">H2</button>
+          <button type="button" class="tool-btn" data-act="h3" title="三级标题">H3</button>
+          <span class="tool-sep"></span>
+          <button type="button" class="tool-btn is-strong" data-act="bold" title="粗体（Ctrl + B）">B</button>
+          <button type="button" class="tool-btn is-italic" data-act="italic" title="斜体（Ctrl + I）">I</button>
+          <button type="button" class="tool-btn is-mark" data-act="mark" title="高亮重点（Ctrl + Shift + H）">高亮</button>
+          <button type="button" class="tool-btn is-strike" data-act="strike" title="删除线">S</button>
+          <span class="tool-sep"></span>
+          <button type="button" class="tool-btn" data-act="ul" title="无序列表">• 列表</button>
+          <button type="button" class="tool-btn" data-act="ol" title="有序列表">1. 列表</button>
+          <button type="button" class="tool-btn" data-act="quote" title="引用">❝ 引用</button>
+          <span class="tool-sep"></span>
+          <button type="button" class="tool-btn is-code" data-act="code" title="行内代码（Ctrl + E）">代码</button>
+          <button type="button" class="tool-btn is-code" data-act="codeblock" title="C# 代码块">C# 块</button>
+          <span class="tool-sep"></span>
+          <button type="button" class="tool-btn" data-act="link" title="插入链接（Ctrl + K）">链接</button>
+          <button type="button" class="tool-btn" data-act="image" title="上传图片（也可以直接 Ctrl + V 粘贴截图）">图片</button>
+          <button type="button" class="tool-btn" data-act="table" title="插入表格">表格</button>
+          <button type="button" class="tool-btn" data-act="hr" title="分割线">分割线</button>
+        </div>
+
+        <div class="editor-panes" id="editorPanes">
+          <textarea id="editorBody" class="editor-body" spellcheck="false" placeholder="用 Markdown 写笔记。代码块用 ```cs 包起来会自动高亮；重点内容用 ==两个等号== 包起来会变成荧光笔高亮；截图可以直接 Ctrl + V 粘贴进来。"></textarea>
+          <div class="editor-preview markdown" id="editorPreview"></div>
+        </div>
+        <input type="file" id="imageInput" accept="image/*" hidden>
+
+        <div class="editor-hint">
+          <span class="editor-hint-text">Ctrl + S 保存 · Ctrl + B 粗体 · Ctrl + I 斜体 · Ctrl + E 行内代码 · Tab 缩进 · 截图可直接 Ctrl + V 粘贴</span>
+          <span class="editor-stat" id="editorStat"></span>
+        </div>
       </section>
 
       <div class="empty" id="emptyState">
