@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>学习笔记</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github.min.css" id="hljsLight">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/styles/github-dark.min.css" id="hljsDark" disabled>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <button class="icon-btn only-narrow" id="menuBtn" title="目录" aria-label="打开目录">☰</button>
+
+    <div class="brand">
+      <span class="brand-mark">N</span>
+      <h1>学习笔记</h1>
+    </div>
+
+    <div class="search">
+      <input id="searchInput" type="search" placeholder="搜索标题或正文…" autocomplete="off" spellcheck="false">
+    </div>
+
+    <div class="topbar-actions">
+      <button class="status" id="statusChip" title="同步状态">
+        <span class="dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">未连接</span>
+      </button>
+      <button class="icon-btn" id="newNoteBtn" title="新建笔记" aria-label="新建笔记">＋</button>
+      <button class="icon-btn" id="themeBtn" title="切换深色模式" aria-label="切换深色模式">◐</button>
+      <button class="icon-btn" id="settingsBtn" title="设置" aria-label="设置">⚙</button>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <span>全部笔记</span>
+        <span class="count" id="noteCount">0</span>
+      </div>
+      <nav class="notelist" id="noteList"></nav>
+      <div class="sidebar-foot">
+        <button class="ghost-btn" id="refreshBtn">刷新</button>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+
+      <article class="reader" id="reader" hidden>
+        <div class="reader-head">
+          <div class="reader-title">
+            <h2 id="noteTitle"></h2>
+            <p class="note-meta" id="noteMeta"></p>
+          </div>
+          <div class="actions">
+            <button class="ghost-btn" id="editBtn">编辑</button>
+            <button class="ghost-btn is-danger" id="deleteBtn">删除</button>
+          </div>
+        </div>
+        <div class="markdown" id="markdownBody"></div>
+      </article>
+
+      <section class="editor" id="editor" hidden>
+        <div class="editor-head">
+          <input id="editorPath" class="path-input" placeholder="笔记路径，例如 CSharp/基础语法.md" spellcheck="false">
+          <div class="actions">
+            <button class="ghost-btn" id="cancelEditBtn">取消</button>
+            <button class="primary-btn" id="saveBtn">保存</button>
+          </div>
+        </div>
+        <textarea id="editorBody" class="editor-body" spellcheck="false" placeholder="用 Markdown 写笔记，代码块用 ```cs 包起来就会高亮"></textarea>
+        <div class="editor-hint">Ctrl + S 保存 · 内容会自动存为草稿</div>
+      </section>
+
+      <div class="empty" id="emptyState">
+        <div class="empty-inner">
+          <p class="empty-kicker">还没有连接笔记仓库</p>
+          <h2>把你的 C# 笔记，随身带着走</h2>
+          <p class="empty-sub">点右上角 ⚙ 填入 GitHub 用户名、仓库名和一个访问令牌，之后在任何电脑打开这个网址都能读到同一份笔记。</p>
+          <button class="primary-btn" id="emptySetupBtn">开始设置</button>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+
+<div class="modal" id="settingsModal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>设置</h2>
+      <button class="icon-btn" id="closeSettingsBtn" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <label class="field">
+        <span>GitHub 用户名</span>
+        <input id="cfgOwner" placeholder="例如 zhangsan" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>仓库名</span>
+        <input id="cfgRepo" placeholder="例如 Notes" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>访问令牌 Token</span>
+        <input id="cfgToken" type="password" placeholder="github_pat_… 或 ghp_…" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>分支（留空自动识别）</span>
+        <input id="cfgBranch" placeholder="main" spellcheck="false" autocomplete="off">
+      </label>
+
+      <p class="hint">
+        令牌相当于笔记仓库的钥匙，只保存在这台电脑的浏览器里，不会上传到任何服务器。
+        请勿把令牌贴在公开的地方；如果怀疑泄露，回到 GitHub 撤销它即可。
+      </p>
+      <p class="hint" id="cfgError" hidden></p>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost-btn" id="testConnBtn">测试连接</button>
+      <div class="actions">
+        <button class="ghost-btn" id="clearCfgBtn">清空</button>
+        <button class="primary-btn" id="saveCfgBtn">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.9.0/highlight.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
