@@ -8,7 +8,8 @@
 const API = 'https://api.github.com';
 const CFG_KEY = 'gnote.config.v1';
 const CACHE_KEY = 'gnote.cache.v1';
-const DRAFT_KEY = 'gnote.draft.v1';
+const DRAFT_KEY = 'gnote.draft.v2';    /* v1 是整篇源码草稿，格式已不同，换 key 免得误读 */
+const MARK_NAME = 'gnote';             /* 打包标记里写进 md 的那一行注释 */
 const THEME_KEY = 'gnote.theme';
 
 const els = {};
@@ -28,8 +29,10 @@ function cacheDom() {
     'menuBtn', 'sidebar', 'searchInput', 'statusChip', 'statusDot', 'statusText',
     'newNoteBtn', 'themeBtn', 'settingsBtn', 'noteCount', 'noteList', 'refreshBtn',
     'reader', 'noteTitle', 'noteMeta', 'markdownBody', 'editBtn', 'deleteBtn',
-    'editor', 'editorPath', 'editorBody', 'cancelEditBtn', 'saveBtn',
+    'editor', 'editorPath', 'cancelEditBtn', 'saveBtn',
     'toolbar', 'editorPanes', 'editorPreview', 'previewToggleBtn', 'editorStat', 'imageInput',
+    'noteForm', 'formTitle', 'addTermBtn', 'termsRows', 'termsEmpty',
+    'blockList', 'blockCount', 'addBlockSelect',
     'emptyState', 'emptySetupBtn', 'scrim', 'settingsModal', 'closeSettingsBtn',
     'cfgOwner', 'cfgRepo', 'cfgToken', 'cfgBranch', 'cfgError',
     'testConnBtn', 'clearCfgBtn', 'saveCfgBtn', 'toast', 'main',
@@ -590,39 +593,42 @@ function resolveImagePath(src, notePath) {
   return out.join('/');
 }
 
-async function enhanceImages(root, notePath) {
-  const list = root.querySelectorAll('img');
-  await Promise.all([...list].map(async img => {
-    const repoPath = resolveImagePath(img.getAttribute('src'), notePath);
-    if (!repoPath) return;   /* 外链图片交给浏览器自己加载 */
-
-    img.classList.add('is-loading');
-    try {
-      let url = imageUrls.get(repoPath);
-      if (!url) {
-        const res = await fetch(
-          API + `/repos/${cfg.owner}/${cfg.repo}/contents/${encodePath(repoPath)}`
-            + (cfg.branch ? '?ref=' + encodeURIComponent(cfg.branch) : ''),
-          {
-            headers: {
-              Accept: 'application/vnd.github.raw',
-              Authorization: 'Bearer ' + cfg.token,
-              'X-GitHub-Api-Version': '2022-11-28'
-            }
+/** 取回私有仓库里的图片字节，换成临时地址塞进 img */
+async function loadRepoImage(img, repoPath) {
+  img.classList.add('is-loading');
+  try {
+    let url = imageUrls.get(repoPath);
+    if (!url) {
+      const res = await fetch(
+        API + `/repos/${cfg.owner}/${cfg.repo}/contents/${encodePath(repoPath)}`
+          + (cfg.branch ? '?ref=' + encodeURIComponent(cfg.branch) : ''),
+        {
+          headers: {
+            Accept: 'application/vnd.github.raw',
+            Authorization: 'Bearer ' + cfg.token,
+            'X-GitHub-Api-Version': '2022-11-28'
           }
-        );
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        url = URL.createObjectURL(await res.blob());
-        imageUrls.set(repoPath, url);
-      }
-      img.src = url;
-    } catch (e) {
-      img.removeAttribute('src');
-      img.classList.add('is-broken');
-      img.alt = '图片读不到：' + repoPath;
-    } finally {
-      img.classList.remove('is-loading');
+        }
+      );
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      url = URL.createObjectURL(await res.blob());
+      imageUrls.set(repoPath, url);
     }
+    img.src = url;
+  } catch (e) {
+    img.removeAttribute('src');
+    img.classList.add('is-broken');
+    img.alt = '图片读不到：' + repoPath;
+  } finally {
+    img.classList.remove('is-loading');
+  }
+}
+
+async function enhanceImages(root, notePath) {
+  await Promise.all([...root.querySelectorAll('img')].map(img => {
+    const repoPath = resolveImagePath(img.getAttribute('src'), notePath);
+    if (!repoPath) return null;   /* 外链图片交给浏览器自己加载 */
+    return loadRepoImage(img, repoPath);
   }));
 }
 
@@ -636,7 +642,7 @@ function selectNote(path) {
   els.reader.hidden = false;
 
   els.noteTitle.textContent = n.title || n.path;
-  els.noteMeta.textContent = n.path + ' · ' + (n.text || '').length + ' 字符';
+  els.noteMeta.textContent = n.path + ' · ' + stripMark(n.text).length + ' 字符';
   els.markdownBody.innerHTML = renderMarkdown(n.text);
   enhanceCodeBlocks();
   enhanceImages(els.markdownBody, n.path);
@@ -666,6 +672,317 @@ function showEmpty() {
   document.title = '学习笔记';
 }
 
+/* ==========================================================================
+   结构化笔记：表单 ⇄ Markdown
+   网页上按栏目填，保存时打包成一整篇 Markdown 存进仓库；
+   下次打开先把 md 里那一行打包标记拆回来，还原成表单。
+   老笔记没有这行标记，就按正文现场拆解，拆到哪算哪，认不出的内容进「原样 Markdown」块。
+   ========================================================================== */
+
+let formModel = null;        /* 编辑中的结构化内容 */
+let activeFieldEl = null;    /* 最后聚焦过的文本框，行内工具条作用于它 */
+let pendingImageIdx = null;  /* 「换一张」时记住要替换哪一块 */
+
+const MARK_RE = /^\s*<!--\s*gnote\s+([A-Za-z0-9+/=]+)\s*-->/;
+
+const BLOCK_LABELS = {
+  para: '段落', heading: '小标题', bullets: '要点列表',
+  code: '代码', image: '图片', note: '提示 / 引用', raw: '原样 Markdown'
+};
+
+const CODE_LANGS = [
+  ['cs', 'C#'], ['js', 'JavaScript'], ['html', 'HTML'], ['css', 'CSS'],
+  ['json', 'JSON'], ['bash', '命令行'], ['sql', 'SQL'], ['text', '纯文本']
+];
+
+const BLOCK_PLACEHOLDERS = {
+  para: '正常写就行，支持 **粗体**、==高亮==、`行内代码` 这些写法。',
+  heading: '这一节的标题，例如：常用访问修饰符',
+  bullets: '一行一个要点，回车换下一条。',
+  code: '把代码贴进来，会自动高亮。',
+  note: '写需要注意的地方，会显示成引用块。',
+  raw: '原样写 Markdown，适合表格这类结构化内容。'
+};
+
+const TABLE_SNIPPET = '| 概念 | 说明 |\n| --- | --- |\n| 示例 | 示例 |';
+
+/* ------------------------------------------------------------- 数据模型 */
+
+function str(v) { return typeof v === 'string' ? v : ''; }
+
+function newBlock(type) {
+  switch (type) {
+    case 'heading': return { type: 'heading', level: 3, text: '' };
+    case 'bullets': return { type: 'bullets', text: '' };
+    case 'code': return { type: 'code', lang: 'cs', code: '' };
+    case 'image': return { type: 'image', alt: '', src: '' };
+    case 'note': return { type: 'note', text: '' };
+    case 'raw': return { type: 'raw', md: '' };
+    default: return { type: 'para', text: '' };
+  }
+}
+
+function emptyModel() {
+  return { title: '', terms: [], blocks: [newBlock('para')] };
+}
+
+/** 把任何来源的数据收拾成合法模型；认不出的块降级成「原样 Markdown」，保证不丢内容 */
+function normalizeModel(raw) {
+  const out = { title: '', terms: [], blocks: [] };
+  if (!raw || typeof raw !== 'object') return out;
+
+  out.title = str(raw.title);
+
+  if (Array.isArray(raw.terms)) {
+    raw.terms.forEach(t => {
+      if (!t || typeof t !== 'object') return;
+      const key = str(t.key).trim();
+      const def = str(t.def).trim();
+      if (key && def) out.terms.push({ key, def });
+    });
+  }
+
+  if (Array.isArray(raw.blocks)) {
+    raw.blocks.forEach(b => {
+      if (!b || typeof b !== 'object') return;
+      const known = Object.prototype.hasOwnProperty.call(BLOCK_LABELS, b.type);
+      const type = known ? b.type : 'raw';
+      const nb = newBlock(type);
+
+      if (type === 'heading') {
+        const lv = Number(b.level);
+        nb.level = (lv === 2 || lv === 3 || lv === 4) ? lv : 3;
+        nb.text = str(b.text);
+      } else if (type === 'code') {
+        nb.lang = str(b.lang) || 'cs';
+        nb.code = str(b.code);
+      } else if (type === 'image') {
+        nb.alt = str(b.alt);
+        nb.src = str(b.src);
+      } else if (type === 'raw') {
+        nb.md = str(b.md) || str(b.text) || str(b.code) || str(b.value);
+      } else {
+        nb.text = str(b.text) || str(b.md);
+      }
+      out.blocks.push(nb);
+    });
+  }
+
+  if (!out.blocks.length) out.blocks.push(newBlock('para'));
+  return out;
+}
+
+/* --------------------------------------------------------------- 打包 */
+
+/** 正文里的图片按笔记所在层级写成相对路径，这样在 GitHub 网页上也能直接显示 */
+function relativePrefix(notePath) {
+  const p = str(notePath).trim();
+  return p.includes('/') ? '../'.repeat(p.slice(0, p.lastIndexOf('/')).split('/').length) : '';
+}
+
+function imageMarkdown(src, alt, notePath) {
+  return '![' + (str(alt).trim() || '图片') + '](' + relativePrefix(notePath) + str(src).trim() + ')';
+}
+
+function packBlock(b, notePath) {
+  switch (b.type) {
+    case 'heading': {
+      const t = str(b.text).replace(/\s+/g, ' ').trim();
+      return t ? '#'.repeat(Number(b.level) || 3) + ' ' + t : '';
+    }
+    case 'bullets': {
+      const items = str(b.text).split('\n').map(s => s.trim()).filter(Boolean);
+      return items.length ? items.map(s => '- ' + s).join('\n') : '';
+    }
+    case 'code': {
+      const code = str(b.code).replace(/\s+$/, '');
+      return code ? '```' + (str(b.lang) || 'cs') + '\n' + code + '\n```' : '';
+    }
+    case 'image': {
+      const src = str(b.src).trim();
+      return src ? imageMarkdown(src, b.alt, notePath) : '';
+    }
+    case 'note': {
+      const t = str(b.text).trim();
+      return t ? t.split('\n').map(l => '> ' + l).join('\n') : '';
+    }
+    case 'raw':
+      return str(b.md).replace(/\s+$/, '');
+    default:
+      return str(b.text).trim();
+  }
+}
+
+/** 只打包正文；预览和字数统计用的就是这份，所见即所存 */
+function packBody(model, notePath) {
+  const out = [];
+
+  const title = str(model.title).replace(/\s+/g, ' ').trim();
+  if (title) out.push('# ' + title);
+
+  const terms = (model.terms || []).filter(t => str(t.key).trim() && str(t.def).trim());
+  if (terms.length) {
+    out.push(
+      '```terms\n'
+      + terms.map(t => str(t.key).trim() + ' = ' + str(t.def).replace(/\s+/g, ' ').trim()).join('\n')
+      + '\n```'
+    );
+  }
+
+  (model.blocks || []).forEach(b => {
+    const chunk = packBlock(b, notePath);
+    if (chunk) out.push(chunk);
+  });
+
+  return out.join('\n\n') + '\n';
+}
+
+/** 整篇 md = 一行看不出来的打包标记 + 正常可读的正文 */
+function packNote(model, notePath) {
+  return '<!-- ' + MARK_NAME + ' ' + textToB64(JSON.stringify(model)) + ' -->\n\n'
+    + packBody(model, notePath);
+}
+
+/* --------------------------------------------------------------- 拆包 */
+
+function b64ToText(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+/** 去掉打包标记，只留正文（阅读区显示字数用） */
+function stripMark(text) {
+  const src = str(text);
+  const m = MARK_RE.exec(src);
+  return m ? src.slice(m[0].length).replace(/^\s+/, '') : src;
+}
+
+/** 有打包标记就用标记里的数据，没有就按老格式的正文现场拆 */
+function unpackNote(text) {
+  const src = str(text);
+  const m = MARK_RE.exec(src);
+  if (m) {
+    try {
+      return { model: normalizeModel(JSON.parse(b64ToText(m[1]))), legacy: false };
+    } catch (e) { /* 标记坏了就退回按正文解析，至少正文还在 */ }
+  }
+  return { model: mdToBlocks(src), legacy: true };
+}
+
+/** 老笔记解析：只认最常用的几种写法，认不出的整段进「原样 Markdown」块 */
+function mdToBlocks(text) {
+  const lines = str(text).replace(/\r\n?/g, '\n').split('\n');
+  const model = { title: '', terms: [], blocks: [] };
+  const buf = [];
+
+  const flushPara = () => {
+    const t = buf.join('\n').trim();
+    buf.length = 0;
+    if (t) model.blocks.push({ type: 'para', text: t });
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    /* 代码围栏：terms 块收进术语表，其余当代码块 */
+    const fence = /^\s*```+\s*([\w-]*)\s*$/.exec(line);
+    if (fence) {
+      flushPara();
+      const lang = fence[1] || '';
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```+\s*$/.test(lines[i])) { body.push(lines[i]); i++; }
+      i++;                                   /* 跳过收尾的那行围栏 */
+      const code = body.join('\n').replace(/\s+$/, '');
+      if (lang === 'terms') {
+        code.split('\n').forEach(l => {
+          const cut = l.indexOf('=');
+          if (cut < 0) return;
+          const key = l.slice(0, cut).trim();
+          const def = l.slice(cut + 1).trim();
+          if (key && def) model.terms.push({ key, def });
+        });
+      } else if (code) {
+        model.blocks.push({ type: 'code', lang: lang || 'cs', code });
+      }
+      continue;
+    }
+
+    /* 分隔线原样留着 */
+    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushPara();
+      model.blocks.push({ type: 'raw', md: line.trim() });
+      i++;
+      continue;
+    }
+
+    /* 标题：开头的第一个 # 当标题，其余按层级降成小标题 */
+    const head = /^\s*(#{1,6})\s+(.*)$/.exec(line);
+    if (head) {
+      flushPara();
+      const level = head[1].length;
+      const t = head[2].trim();
+      if (level === 1 && !model.title && !model.blocks.length) model.title = t;
+      else model.blocks.push({ type: 'heading', level: Math.min(Math.max(level, 2), 4), text: t });
+      i++;
+      continue;
+    }
+
+    /* 列表：连续几行并成一个要点块，每行去掉记号 */
+    if (/^\s*(?:[-*+]|\d+\.)\s+/.test(line)) {
+      flushPara();
+      const items = [];
+      while (i < lines.length && /^\s*(?:[-*+]|\d+\.)\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*(?:[-*+]|\d+\.)\s+/, '').trim());
+        i++;
+      }
+      model.blocks.push({ type: 'bullets', text: items.join('\n') });
+      continue;
+    }
+
+    /* 引用 */
+    if (/^\s*>\s?/.test(line)) {
+      flushPara();
+      const quote = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ''));
+        i++;
+      }
+      model.blocks.push({ type: 'note', text: quote.join('\n').trim() });
+      continue;
+    }
+
+    /* 单独占一行的图片 */
+    const img = /^\s*!\[([^\]]*)\]\(([^)\s]+)\)\s*$/.exec(line);
+    if (img) {
+      flushPara();
+      model.blocks.push({ type: 'image', alt: img[1], src: resolveImagePath(img[2], '') || img[2] });
+      i++;
+      continue;
+    }
+
+    /* 表格与 HTML 这类结构，整段原样保留 */
+    if (/^\s*\|/.test(line) || /^\s*</.test(line)) {
+      flushPara();
+      const keep = [];
+      while (i < lines.length && lines[i].trim()) { keep.push(lines[i]); i++; }
+      model.blocks.push({ type: 'raw', md: keep.join('\n') });
+      continue;
+    }
+
+    if (!line.trim()) { flushPara(); i++; continue; }
+
+    buf.push(line);
+    i++;
+  }
+
+  flushPara();
+  return normalizeModel(model);
+}
+
 /* ------------------------------------------------------------------ 编辑器 */
 
 function readDraft() {
@@ -676,10 +993,10 @@ function readDraft() {
 function scheduleDraft() {
   clearTimeout(draftTimer);
   draftTimer = setTimeout(() => {
-    if (els.editor.hidden) return;
+    if (els.editor.hidden || !formModel) return;
     try {
       localStorage.setItem(DRAFT_KEY, JSON.stringify({
-        mode: editorMode, path: els.editorPath.value, body: els.editorBody.value
+        mode: editorMode, path: els.editorPath.value, model: syncFormToModel()
       }));
     } catch (e) { /* 忽略 */ }
   }, 600);
@@ -690,32 +1007,17 @@ function clearDraft() {
   localStorage.removeItem(DRAFT_KEY);
 }
 
-/* --------------------------------------------------------- 编辑区工具条 */
+/* --------------------------------------------- 行内格式（作用于当前文本框） */
 
-/** 取当前选区覆盖到的整行 */
-function selectedLines() {
-  const ta = els.editorBody;
-  const value = ta.value;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const from = value.lastIndexOf('\n', start - 1) + 1;
-  let to = value.indexOf('\n', end);
-  if (to === -1) to = value.length;
-
-  const lines = value.slice(from, to).split('\n');
-  const apply = nextLines => {
-    const text = nextLines.join('\n');
-    ta.value = value.slice(0, from) + text + value.slice(to);
-    ta.setSelectionRange(from, from + text.length);
-    ta.focus();
-    onEditorChanged();
-  };
-  return { lines, apply };
+/** 光标所在的文本框；工具条和快捷键都作用在它身上 */
+function activeField() {
+  const a = document.activeElement;
+  if (a && a.tagName === 'TEXTAREA' && a.classList.contains('block-input')) return a;
+  return activeFieldEl && document.contains(activeFieldEl) ? activeFieldEl : null;
 }
 
 /** 用标记包住选区；如果已经在标记里面，再点一次就取消包裹 */
-function wrapSelection(before, after, placeholder) {
-  const ta = els.editorBody;
+function wrapSelectionIn(ta, before, after, placeholder) {
   const value = ta.value;
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
@@ -727,87 +1029,23 @@ function wrapSelection(before, after, placeholder) {
     ta.value = value.slice(0, start - before.length) + value.slice(start, end) + value.slice(end + after.length);
     ta.focus();
     ta.setSelectionRange(start - before.length, end - before.length);
-    onEditorChanged();
-    return;
+  } else {
+    const picked = value.slice(start, end) || placeholder || '';
+    ta.value = value.slice(0, start) + before + picked + after + value.slice(end);
+    ta.focus();
+    ta.setSelectionRange(start + before.length, start + before.length + picked.length);
   }
-
-  const picked = value.slice(start, end) || placeholder || '';
-  ta.value = value.slice(0, start) + before + picked + after + value.slice(end);
-  ta.focus();
-  ta.setSelectionRange(start + before.length, start + before.length + picked.length);
   onEditorChanged();
 }
 
-function toggleHeading(level) {
-  const prefix = '#'.repeat(level) + ' ';
-  const { lines, apply } = selectedLines();
-  const all = lines.every(l => l.trimStart().startsWith(prefix));
-  apply(lines.map(l => {
-    const bare = l.replace(/^\s*#{1,6}\s+/, '');
-    return all ? bare : prefix + bare;
-  }));
+function wrapSelection(before, after, placeholder) {
+  const ta = activeField();
+  if (!ta) { toast('先把光标放进一个文本框里，再点这个按钮'); return; }
+  wrapSelectionIn(ta, before, after, placeholder);
 }
 
-function toggleList(ordered) {
-  const { lines, apply } = selectedLines();
-  const re = /^\s*(?:[-*+]|\d+\.)\s+/;
-  const all = lines.every(l => re.test(l));
-  let n = 0;
-  apply(lines.map(l => {
-    const bare = l.replace(re, '');
-    if (all) return bare;
-    if (ordered) { n += 1; return n + '. ' + bare; }
-    return '- ' + bare;
-  }));
-}
+/* 块级内容（标题、列表、引用、代码块）已经改成表单里的「内容块」，不再需要往一段源码里插了 */
 
-function toggleQuote() {
-  const { lines, apply } = selectedLines();
-  const re = /^\s*>\s?/;
-  const all = lines.every(l => re.test(l));
-  apply(lines.map(l => (all ? l.replace(re, '') : '> ' + l.replace(re, ''))));
-}
-
-/** 在光标处插入块级内容，必要时前后补换行 */
-function insertBlock(text, selFrom, selTo) {
-  const ta = els.editorBody;
-  const value = ta.value;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const before = value.slice(0, start);
-  const after = value.slice(end);
-
-  const lead = (before && !before.endsWith('\n')) ? '\n' : '';
-  const trail = (after && !after.startsWith('\n')) ? '\n' : '';
-
-  ta.value = before + lead + text + trail + after;
-  ta.focus();
-  const base = start + lead.length;
-  ta.setSelectionRange(base + (selFrom || 0), base + (selTo === undefined ? (selFrom || 0) : selTo));
-  onEditorChanged();
-}
-
-/** 插入 C# 代码块；有选中内容就包起来 */
-function insertCodeBlock() {
-  const ta = els.editorBody;
-  const value = ta.value;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  const picked = value.slice(start, end);
-  const before = value.slice(0, start);
-  const after = value.slice(end);
-
-  const head = '```cs\n';
-  const tail = '\n```';
-  const lead = (before && !before.endsWith('\n')) ? '\n' : '';
-  const trail = (after && !after.startsWith('\n')) ? '\n' : '';
-
-  ta.value = before + lead + head + picked + tail + trail + after;
-  ta.focus();
-  const bodyStart = start + lead.length + head.length;
-  ta.setSelectionRange(bodyStart, bodyStart + picked.length);
-  onEditorChanged();
-}
 
 /* -------------------------------------------------------------- 图片上传 */
 
@@ -831,16 +1069,16 @@ function safeImageName(original) {
   return base + '-' + stamp + ext;
 }
 
-/** 按笔记所在的层级算出相对写法，这样在 GitHub 网页里也能正常显示 */
-function imageMarkdown(repoPath, alt) {
-  const notePath = (els.editorPath.value || '').trim();
-  const depth = notePath.includes('/')
-    ? notePath.slice(0, notePath.lastIndexOf('/')).split('/').length
-    : 0;
-  return '![' + (alt || '图片') + '](' + '../'.repeat(depth) + repoPath + ')';
+/** 选一张图交给某个图片块去替换 */
+function pickImageFor(idx) {
+  if (!hasConfig()) { toast('先点右上角 ⚙ 填好设置，才能把图片存进仓库'); return; }
+  pendingImageIdx = idx;
+  els.imageInput.value = '';
+  els.imageInput.click();
 }
 
-async function saveImage(file) {
+/** 上传一张图并挂进内容块；target 为 { kind, idx }，没有 target 就追加到末尾 */
+async function saveImage(file, target) {
   if (!hasConfig()) { toast('先点右上角 ⚙ 填好设置，才能把图片存进仓库'); return; }
   if (!/^image\//i.test(file.type || '')) { toast('只能上传图片文件'); return; }
   if (file.size > 4 * 1024 * 1024) {
@@ -849,7 +1087,7 @@ async function saveImage(file) {
   }
 
   const repoPath = IMAGE_DIR + '/' + safeImageName(file.name);
-  const alt = (file.name || '').replace(/\.[^.]+$/, '') || '图片';
+  const alt = str(file.name).replace(/\.[^.]+$/, '') || '图片';
 
   setStatus('busy', '上传图片');
   try {
@@ -866,7 +1104,22 @@ async function saveImage(file) {
         })
       }
     );
-    insertBlock(imageMarkdown(repoPath, alt));
+
+    syncFormToModel();
+    if (target && target.kind === 'replace' && formModel.blocks[target.idx]) {
+      const block = formModel.blocks[target.idx];
+      block.src = repoPath;
+      if (!block.alt) block.alt = alt;
+    } else {
+      const block = newBlock('image');
+      block.src = repoPath;
+      block.alt = alt;
+      const at = target && target.idx != null ? target.idx + 1 : formModel.blocks.length;
+      formModel.blocks.splice(at, 0, block);
+    }
+    renderBlocks();
+    onEditorChanged();
+
     setStatus('ok', '图片已上传');
     toast('图片已存进仓库：' + repoPath);
   } catch (err) {
@@ -875,46 +1128,24 @@ async function saveImage(file) {
   }
 }
 
-function pickImage() {
-  if (!hasConfig()) { toast('先点右上角 ⚙ 填好设置，才能把图片存进仓库'); return; }
-  els.imageInput.value = '';
-  els.imageInput.click();
-}
-
-const TABLE_SNIPPET = '| 概念 | 说明 |\n| --- | --- |\n| 示例 | 示例 |';
-
 function applyToolAction(act) {
   switch (act) {
-    case 'h1': toggleHeading(1); break;
-    case 'h2': toggleHeading(2); break;
-    case 'h3': toggleHeading(3); break;
     case 'bold': wrapSelection('**', '**', '粗体'); break;
     case 'italic': wrapSelection('*', '*', '斜体'); break;
     case 'mark': wrapSelection('==', '==', '高亮'); break;
     case 'strike': wrapSelection('~~', '~~', '删除线'); break;
-    case 'ul': toggleList(false); break;
-    case 'ol': toggleList(true); break;
-    case 'quote': toggleQuote(); break;
     case 'code': wrapSelection('`', '`', '代码'); break;
-    case 'codeblock': insertCodeBlock(); break;
     case 'link': wrapSelection('[', '](https://)', '链接文字'); break;
-    case 'image': pickImage(); break;
-    case 'table': insertBlock(TABLE_SNIPPET, 2, 4); break;
-    case 'hr': insertBlock('---\n'); break;
   }
 }
 
 /** Tab 缩进，Shift + Tab 反缩进 */
-function handleEditorTab(e) {
-  if (e.key !== 'Tab') return;
-  e.preventDefault();
-
-  const ta = els.editorBody;
+function applyTab(ta, shift) {
   const value = ta.value;
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
 
-  if (start === end && !e.shiftKey) {
+  if (start === end && !shift) {
     ta.value = value.slice(0, start) + '  ' + value.slice(end);
     ta.setSelectionRange(start + 2, start + 2);
   } else {
@@ -922,7 +1153,7 @@ function handleEditorTab(e) {
     let to = value.indexOf('\n', end);
     if (to === -1) to = value.length;
     const text = value.slice(from, to).split('\n')
-      .map(l => (e.shiftKey ? l.replace(/^ {1,2}/, '') : '  ' + l))
+      .map(l => (shift ? l.replace(/^ {1,2}/, '') : '  ' + l))
       .join('\n');
     ta.value = value.slice(0, from) + text + value.slice(to);
     ta.setSelectionRange(from, from + text.length);
@@ -931,10 +1162,11 @@ function handleEditorTab(e) {
   onEditorChanged();
 }
 
-/* 实时预览与字数统计 */
+/* 实时预览与字数统计：预览的就是「打包后的正文」，所见即所存 */
 function paintEditorPreview() {
   if (!els.editorPanes.classList.contains('is-preview')) return;
-  els.editorPreview.innerHTML = renderMarkdown(els.editorBody.value);
+  const body = packBody(syncFormToModel(), els.editorPath.value);
+  els.editorPreview.innerHTML = renderMarkdown(body);
   enhanceCodeBlocks(els.editorPreview);
   enhanceImages(els.editorPreview, (els.editorPath.value || '').trim());
 }
@@ -942,12 +1174,13 @@ function paintEditorPreview() {
 const paintEditorPreviewLater = debounce(paintEditorPreview, 180);
 
 function updateEditorStat() {
-  const text = els.editorBody.value;
-  const lines = text ? text.split('\n').length : 0;
-  els.editorStat.textContent = text.length + ' 字符 · ' + lines + ' 行';
+  const body = packBody(syncFormToModel(), els.editorPath.value);
+  const blocks = els.blockList.querySelectorAll('.block').length;
+  els.editorStat.textContent = body.length + ' 字符 · ' + blocks + ' 块';
 }
 
 function onEditorChanged() {
+  if (!formModel) return;
   scheduleDraft();
   updateEditorStat();
   paintEditorPreviewLater();
@@ -960,11 +1193,269 @@ function togglePreview() {
   if (on) paintEditorPreview();
 }
 
+/* ------------------------------------------------------------- 表单渲染 */
+
+/** 把界面上的值收回到模型里；结构变动和保存前都要先调一次 */
+function syncFormToModel() {
+  if (!formModel) formModel = emptyModel();
+  formModel.title = els.formTitle.value;
+
+  els.termsRows.querySelectorAll('.term-row').forEach((row, i) => {
+    const t = formModel.terms[i];
+    if (!t) return;
+    t.key = row.querySelector('[data-field="key"]').value;
+    t.def = row.querySelector('[data-field="def"]').value;
+  });
+
+  els.blockList.querySelectorAll('.block').forEach((box, i) => {
+    const b = formModel.blocks[i];
+    if (!b) return;
+    box.querySelectorAll('[data-field]').forEach(f => {
+      b[f.dataset.field] = f.dataset.field === 'level' ? Number(f.value) : f.value;
+    });
+  });
+
+  return formModel;
+}
+
+function fillForm(model) {
+  formModel = normalizeModel(model);
+  els.formTitle.value = formModel.title;
+  renderTerms();
+  renderBlocks();
+  updateEditorStat();
+  paintEditorPreview();
+}
+
+function renderTerms() {
+  els.termsRows.innerHTML = '';
+  (formModel.terms || []).forEach((t, i) => {
+    const row = document.createElement('div');
+    row.className = 'term-row';
+
+    const key = document.createElement('input');
+    key.className = 'term-key-input';
+    key.dataset.field = 'key';
+    key.placeholder = '关键字，如 protected';
+    key.spellcheck = false;
+    key.autocomplete = 'off';
+    key.value = t.key || '';
+
+    const def = document.createElement('input');
+    def.className = 'term-def-input';
+    def.dataset.field = 'def';
+    def.placeholder = '说明，如 只能类内部或派生类访问';
+    def.spellcheck = false;
+    def.autocomplete = 'off';
+    def.value = t.def || '';
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'row-del';
+    del.dataset.del = 'term';
+    del.dataset.idx = String(i);
+    del.title = '删掉这条术语';
+    del.textContent = '✕';
+
+    row.append(key, def, del);
+    els.termsRows.appendChild(row);
+  });
+  els.termsEmpty.hidden = (formModel.terms || []).length > 0;
+}
+
+function renderBlocks() {
+  els.blockList.innerHTML = '';
+  formModel.blocks.forEach((b, i) => els.blockList.appendChild(buildBlockEl(b, i)));
+  els.blockCount.textContent = formModel.blocks.length + ' 块';
+}
+
+function buildBlockEl(b, idx) {
+  const box = document.createElement('div');
+  box.className = 'block';
+  box.dataset.idx = String(idx);
+  box.dataset.type = b.type;
+
+  const head = document.createElement('div');
+  head.className = 'block-head';
+
+  const kind = document.createElement('span');
+  kind.className = 'block-kind';
+  kind.textContent = BLOCK_LABELS[b.type] || '内容';
+  head.appendChild(kind);
+
+  if (b.type === 'heading') head.appendChild(buildSelect('level', '标题层级', [[2, '二级标题'], [3, '三级标题'], [4, '四级标题']], b.level));
+  if (b.type === 'code') head.appendChild(buildSelect('lang', '代码语言', CODE_LANGS, b.lang));
+
+  const tools = document.createElement('div');
+  tools.className = 'block-tools';
+  [['up', '↑', '上移'], ['down', '↓', '下移'], ['del', '✕', '删除这一块']].forEach(([op, txt, title]) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'block-btn';
+    btn.dataset.op = op;
+    btn.dataset.idx = String(idx);
+    btn.textContent = txt;
+    btn.title = title;
+    tools.appendChild(btn);
+  });
+  head.appendChild(tools);
+  box.appendChild(head);
+
+  if (b.type === 'image') box.appendChild(buildImageEl(b, idx));
+  else box.appendChild(buildBlockInput(b));
+
+  return box;
+}
+
+function buildSelect(field, title, options, current) {
+  const sel = document.createElement('select');
+  sel.className = 'block-select';
+  sel.dataset.field = field;
+  sel.title = title;
+  options.forEach(([v, label]) => {
+    const o = document.createElement('option');
+    o.value = String(v);
+    o.textContent = label;
+    sel.appendChild(o);
+  });
+  const values = options.map(o => String(o[0]));
+  sel.value = values.indexOf(String(current)) >= 0 ? String(current) : values[0];
+  return sel;
+}
+
+function buildBlockInput(b) {
+  const ta = document.createElement('textarea');
+  ta.className = 'block-input';
+  ta.spellcheck = false;
+  ta.placeholder = BLOCK_PLACEHOLDERS[b.type] || '';
+
+  if (b.type === 'code') {
+    ta.dataset.field = 'code';
+    ta.classList.add('is-mono');
+    ta.rows = 6;
+    ta.value = b.code || '';
+  } else if (b.type === 'raw') {
+    ta.dataset.field = 'md';
+    ta.classList.add('is-mono');
+    ta.rows = 5;
+    ta.value = b.md || '';
+  } else {
+    ta.dataset.field = 'text';
+    ta.rows = b.type === 'bullets' ? 4 : 3;
+    ta.value = b.text || '';
+  }
+  return ta;
+}
+
+function buildImageEl(b, idx) {
+  const wrap = document.createElement('div');
+  wrap.className = 'block-image';
+
+  const thumb = document.createElement('div');
+  thumb.className = 'block-thumb';
+  if (b.src) {
+    const img = document.createElement('img');
+    img.alt = b.alt || '图片';
+    thumb.appendChild(img);
+    loadRepoImage(img, b.src);          /* 私有仓库的图得带令牌取字节再显示 */
+  } else {
+    thumb.classList.add('is-empty');
+    thumb.textContent = '还没选图片';
+  }
+
+  const side = document.createElement('div');
+  side.className = 'block-image-side';
+
+  const alt = document.createElement('input');
+  alt.className = 'block-alt';
+  alt.dataset.field = 'alt';
+  alt.placeholder = '图片说明（可选）';
+  alt.spellcheck = false;
+  alt.value = b.alt || '';
+
+  const pick = document.createElement('button');
+  pick.type = 'button';
+  pick.className = 'ghost-btn is-small';
+  pick.dataset.op = 'pick';
+  pick.dataset.idx = String(idx);
+  pick.textContent = b.src ? '换一张' : '选择图片';
+
+  const path = document.createElement('code');
+  path.className = 'block-image-path';
+  path.textContent = b.src ? '仓库路径：' + b.src : '图片会存进仓库，笔记里自动写好相对路径';
+
+  side.append(alt, pick, path);
+  wrap.append(thumb, side);
+  return wrap;
+}
+
+/* --------------------------------------------------------- 内容块增删改 */
+
+function addTerm() {
+  syncFormToModel();
+  formModel.terms.push({ key: '', def: '' });
+  renderTerms();
+  const rows = els.termsRows.querySelectorAll('.term-row');
+  if (rows.length) rows[rows.length - 1].querySelector('[data-field="key"]').focus();
+  onEditorChanged();
+}
+
+function removeTerm(idx) {
+  syncFormToModel();
+  formModel.terms.splice(idx, 1);
+  renderTerms();
+  onEditorChanged();
+}
+
+function addBlock(type) {
+  syncFormToModel();
+  if (type === 'table') {
+    const t = newBlock('raw');      /* 表格就是一段原样 Markdown，先把骨架填好省得你记语法 */
+    t.md = TABLE_SNIPPET;
+    formModel.blocks.push(t);
+  } else {
+    formModel.blocks.push(newBlock(type));
+  }
+  renderBlocks();
+  onEditorChanged();
+
+  const idx = formModel.blocks.length - 1;
+  if (type === 'image') pickImageFor(idx);
+  else focusBlockField(idx);
+}
+
+function moveBlock(idx, delta) {
+  syncFormToModel();
+  const to = idx + delta;
+  if (to < 0 || to >= formModel.blocks.length) return;
+  const moved = formModel.blocks.splice(idx, 1)[0];
+  formModel.blocks.splice(to, 0, moved);
+  renderBlocks();
+  onEditorChanged();
+  focusBlockField(to);
+}
+
+function removeBlock(idx) {
+  syncFormToModel();
+  formModel.blocks.splice(idx, 1);
+  if (!formModel.blocks.length) formModel.blocks.push(newBlock('para'));
+  renderBlocks();
+  onEditorChanged();
+}
+
+function focusBlockField(idx) {
+  const box = els.blockList.querySelector('.block[data-idx="' + idx + '"]');
+  const f = box && box.querySelector('.block-input, .block-alt');
+  if (f) f.focus();
+}
+
+/* ------------------------------------------------------------- 编辑入口 */
+
 function openNewNote() {
   if (!hasConfig()) { openSettings(); return; }
 
   const draft = readDraft();
-  const restore = draft && draft.mode === 'new';
+  const restore = draft && draft.mode === 'new' && draft.model;
 
   editorMode = 'new';
   els.emptyState.hidden = true;
@@ -972,28 +1463,28 @@ function openNewNote() {
   els.editor.hidden = false;
   els.editorPath.disabled = false;
   els.editorPath.value = restore ? (draft.path || '') : '';
-  els.editorBody.value = restore ? (draft.body || '') : '';
+  fillForm(restore ? draft.model : emptyModel());
   els.main.scrollTop = 0;
-  (els.editorPath.value ? els.editorBody : els.editorPath).focus();
+  (els.editorPath.value ? els.formTitle : els.editorPath).focus();
   if (restore) toast('已恢复上次没写完的草稿');
-  updateEditorStat();
-  paintEditorPreview();
 }
 
 function editCurrentNote() {
   const n = notes.find(x => x.path === activePath);
   if (!n) return;
+
+  const { model, legacy } = unpackNote(n.text || '');
+
   editorMode = 'edit';
   els.emptyState.hidden = true;
   els.reader.hidden = true;
   els.editor.hidden = false;
   els.editorPath.disabled = true;
   els.editorPath.value = n.path;
-  els.editorBody.value = n.text || '';
+  fillForm(model);
   els.main.scrollTop = 0;
-  els.editorBody.focus();
-  updateEditorStat();
-  paintEditorPreview();
+  els.formTitle.focus();
+  if (legacy) toast('这篇是老格式，已经自动拆成表单；保存后就会变成表单格式');
 }
 
 function cancelEdit() {
@@ -1019,10 +1510,12 @@ function putNote(path, body, sha) {
 
 async function saveNote() {
   const path = els.editorPath.value.trim().replace(/^\/+/, '');
-  const body = els.editorBody.value;
 
   if (!path) { toast('请先填写笔记路径，例如 CSharp/基础语法.md'); els.editorPath.focus(); return; }
   if (!/\.md$/i.test(path)) { toast('路径需要以 .md 结尾'); els.editorPath.focus(); return; }
+
+  /* 把表单打包成一整篇 Markdown 再提交 */
+  const body = packNote(syncFormToModel(), path);
 
   els.saveBtn.disabled = true;
   setStatus('busy', '保存中');
@@ -1299,9 +1792,63 @@ function bindEvents() {
   els.cancelEditBtn.addEventListener('click', cancelEdit);
   els.saveBtn.addEventListener('click', saveNote);
 
-  els.editorBody.addEventListener('input', onEditorChanged);
   els.editorPath.addEventListener('input', scheduleDraft);
-  els.editorBody.addEventListener('keydown', handleEditorTab);
+
+  els.noteForm.addEventListener('input', onEditorChanged);
+  els.noteForm.addEventListener('change', onEditorChanged);
+
+  /* 记住最后碰过的文本框，行内工具条作用于它 */
+  els.noteForm.addEventListener('focusin', e => {
+    if (e.target.classList && e.target.classList.contains('block-input')) activeFieldEl = e.target;
+  });
+
+  els.noteForm.addEventListener('keydown', e => {
+    const ta = e.target;
+    if (!ta.classList || !ta.classList.contains('block-input')) return;
+    if (ta.tagName === 'TEXTAREA' && e.key === 'Tab') {
+      e.preventDefault();
+      applyTab(ta, e.shiftKey);
+    }
+  });
+
+  /* 截图直接粘贴：Win + Shift + S 截完，回到编辑区 Ctrl + V */
+  els.noteForm.addEventListener('paste', e => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type && item.type.indexOf('image/') === 0) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          const box = e.target.closest ? e.target.closest('.block') : null;
+          saveImage(file, { kind: 'after', idx: box ? Number(box.dataset.idx) : null });
+          return;
+        }
+      }
+    }
+  });
+
+  els.addTermBtn.addEventListener('click', addTerm);
+
+  els.addBlockSelect.addEventListener('change', e => {
+    const type = e.target.value;
+    e.target.value = '';
+    if (type) addBlock(type);
+  });
+
+  /* 内容块与术语行的按钮都走事件委托，省得每次重建都要重新绑 */
+  els.noteForm.addEventListener('click', e => {
+    const delTerm = e.target.closest('button[data-del="term"]');
+    if (delTerm) { removeTerm(Number(delTerm.dataset.idx)); return; }
+
+    const btn = e.target.closest('button[data-op]');
+    if (!btn) return;
+    const idx = Number(btn.dataset.idx);
+    if (btn.dataset.op === 'up') moveBlock(idx, -1);
+    else if (btn.dataset.op === 'down') moveBlock(idx, 1);
+    else if (btn.dataset.op === 'del') removeBlock(idx);
+    else if (btn.dataset.op === 'pick') pickImageFor(idx);
+  });
 
   els.toolbar.addEventListener('mousedown', e => {
     /* 阻止按钮抢走输入框焦点，否则选区会被清掉 */
@@ -1323,19 +1870,9 @@ function bindEvents() {
 
   els.imageInput.addEventListener('change', e => {
     const file = e.target.files && e.target.files[0];
-    if (file) saveImage(file);
-  });
-
-  /* 截图直接粘贴：Win + Shift + S 截完，回到编辑器 Ctrl + V */
-  els.editorBody.addEventListener('paste', e => {
-    const items = e.clipboardData && e.clipboardData.items;
-    if (!items) return;
-    for (const item of items) {
-      if (item.type && item.type.indexOf('image/') === 0) {
-        const file = item.getAsFile();
-        if (file) { e.preventDefault(); saveImage(file); return; }
-      }
-    }
+    const idx = pendingImageIdx;
+    pendingImageIdx = null;
+    if (file) saveImage(file, idx == null ? null : { kind: 'replace', idx });
   });
 
   els.refreshBtn.addEventListener('click', () => loadNotes());
@@ -1358,7 +1895,7 @@ function bindEvents() {
       saveNote();
     }
 
-    if (inEditor && mod && !e.altKey) {
+    if (inEditor && mod && !e.altKey && activeField()) {
       if (e.shiftKey && key === 'h') { e.preventDefault(); wrapSelection('==', '==', '高亮'); }
       else if (!e.shiftKey && key === 'b') { e.preventDefault(); wrapSelection('**', '**', '粗体'); }
       else if (!e.shiftKey && key === 'i') { e.preventDefault(); wrapSelection('*', '*', '斜体'); }
