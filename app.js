@@ -1002,6 +1002,21 @@ function cancelEdit() {
   else showEmpty();
 }
 
+/** 提交一次笔记内容；sha 为 null 表示新建文件 */
+function putNote(path, body, sha) {
+  const payload = {
+    message: (sha ? '更新笔记：' : '新增笔记：') + path,
+    content: textToB64(body),
+    branch: cfg.branch || undefined
+  };
+  if (sha) payload.sha = sha;
+
+  return gh(
+    `/repos/${cfg.owner}/${cfg.repo}/contents/${encodePath(path)}`,
+    { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
+  );
+}
+
 async function saveNote() {
   const path = els.editorPath.value.trim().replace(/^\/+/, '');
   const body = els.editorBody.value;
@@ -1014,19 +1029,19 @@ async function saveNote() {
 
   try {
     const local = notes.find(n => n.path.toLowerCase() === path.toLowerCase());
-    const sha = local ? local.sha : await remoteSha(path);
+    let sha = local ? local.sha : await remoteSha(path);
 
-    const payload = {
-      message: (sha ? '更新笔记：' : '新增笔记：') + path,
-      content: textToB64(body),
-      branch: cfg.branch || undefined
-    };
-    if (sha) payload.sha = sha;
-
-    const res = await gh(
-      `/repos/${cfg.owner}/${cfg.repo}/contents/${encodePath(path)}`,
-      { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }
-    );
+    let res;
+    let retried = false;
+    try {
+      res = await putNote(path, body, sha);
+    } catch (err) {
+      if (err.status !== 409) throw err;
+      /* 远端在这期间被改过（409）：按远端当前的 sha 再提交一次，省得让用户手动刷新 */
+      sha = await remoteSha(path);
+      res = await putNote(path, body, sha);
+      retried = true;
+    }
 
     const newSha = (res && res.content && res.content.sha) || sha || '';
     const entry = { path, sha: newSha, text: body, title: deriveTitle(path, body) };
@@ -1040,7 +1055,7 @@ async function saveNote() {
 
     selectNote(path);
     setStatus('ok', '已同步');
-    toast(sha ? '笔记已更新' : '笔记已创建');
+    toast(sha ? (retried ? '远端有新的改动，已用你当前的内容重新提交' : '笔记已更新') : '笔记已创建');
 
     loadNotes({ silent: true });
   } catch (err) {
