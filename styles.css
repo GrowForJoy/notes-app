@@ -577,6 +577,96 @@ html[data-theme="dark"] .primary-btn { color: #0F3D35; }
 .markdown pre:hover .code-copy { opacity: 1; }
 .code-copy:hover { color: var(--accent); }
 
+/* --------------------------------------------------------------------------
+   说明区（```terms）+ 代码里的关键字徽章
+   -------------------------------------------------------------------------- */
+
+.terms-card {
+  margin: 1.3em 0;
+  padding: 13px 18px 15px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: var(--paper-2);
+}
+
+.terms-head {
+  margin: 0 0 9px;
+  font: 600 11px/1 var(--font-body);
+  letter-spacing: 0.1em;
+  color: var(--ink-3);
+}
+
+.terms-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.term-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 4px 8px;
+  margin: 1px -8px;
+  border-radius: 7px;
+  scroll-margin-top: 24px;
+}
+
+.terms-card .term-key {
+  flex: none;
+  font: 400 0.86em/1.5 var(--font-mono);
+  padding: .16em .42em;
+  border-radius: 5px;
+  background: var(--paper-3);
+  color: var(--accent-ink);
+  white-space: nowrap;
+}
+
+.term-def {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--ink-2);
+}
+
+.term-item.is-flash { animation: term-flash 1.2s ease-out; }
+
+@keyframes term-flash {
+  0% { background: var(--accent-soft); }
+  100% { background: transparent; }
+}
+
+/* 代码里的关键字徽章：默认低调，悬停才上底色 */
+.kw {
+  position: relative;
+  display: inline-block;
+  vertical-align: baseline;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-bottom: 1px dashed var(--accent);
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  text-align: inherit;
+  transition: background .14s ease;
+}
+
+.kw::after {
+  content: '';
+  position: absolute;
+  top: .12em;
+  right: -5px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: .7;
+}
+
+.kw:hover { background: var(--accent-soft); }
+.kw:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 .markdown table {
   width: 100%;
   border-collapse: collapse;

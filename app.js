@@ -355,8 +355,188 @@ function renderMarkdown(text) {
   return '<pre>' + escapeHtml(text || '') + '</pre>';
 }
 
+/* ------------------------------------------------------- 说明区 ⇄ 代码区联动 */
+/* 笔记里用 ```terms 代码块写「关键字 = 说明」，渲染成术语卡片；
+   代码块里出现的关键字会带徽章，悬停看说明、点击跳到对应条目。 */
+
+const KW_SKIP = '.hljs-comment,.hljs-quote,.hljs-string,.hljs-regexp,.hljs-meta,.hljs-doctag,.terms-card,.kw,.code-copy';
+
+function isWordChar(ch) {
+  return !!ch && /[A-Za-z0-9_$]/.test(ch);
+}
+
+/** 把 ```terms 块解析出来并换成术语卡片；返回「关键字 → 条目」的字典 */
+function enhanceTerms(root) {
+  const map = new Map();
+  const dups = [];
+  let seq = 0;
+
+  root.querySelectorAll('pre > code.language-terms').forEach(code => {
+    const pre = code.parentNode;
+    const items = [];
+
+    (code.textContent || '').split('\n').forEach(line => {
+      const cut = line.indexOf('=');
+      if (cut < 0) return;
+      const key = line.slice(0, cut).trim();
+      const def = line.slice(cut + 1).trim();
+      if (key.length < 2 || !def) return;
+      if (/^[^\w\u4e00-\u9fa5]+$/.test(key)) return;
+
+      const item = { key, def, id: 'term-' + (++seq) };
+      items.push(item);
+      if (map.has(key)) dups.push(key);
+      map.set(key, item);
+    });
+
+    if (!items.length) { code.className = 'language-plaintext'; return; }
+    pre.parentNode.replaceChild(buildTermCard(items), pre);
+  });
+
+  if (dups.length) toast('说明区里「' + dups[0] + '」重复了，以后一条为准');
+  return map;
+}
+
+/** 术语卡片：一条术语一个 li，挂在 data-term 上供跳转定位 */
+function buildTermCard(items) {
+  const card = document.createElement('div');
+  card.className = 'terms-card';
+
+  const head = document.createElement('p');
+  head.className = 'terms-head';
+  head.textContent = '术语说明';
+
+  const list = document.createElement('ul');
+  list.className = 'terms-list';
+
+  items.forEach(it => {
+    const li = document.createElement('li');
+    li.className = 'term-item';
+    li.id = it.id;
+    li.dataset.term = it.key;
+
+    const key = document.createElement('code');
+    key.className = 'term-key';
+    key.textContent = it.key;
+
+    const def = document.createElement('span');
+    def.className = 'term-def';
+    def.textContent = it.def;
+
+    li.append(key, def);
+    list.appendChild(li);
+  });
+
+  card.append(head, list);
+  return card;
+}
+
+/** 给代码里命中的关键字套上徽章。只在文本节点上切分，不动 hljs 生成的 <span> */
+function enhanceKeywords(root, map) {
+  if (!map || !map.size) return;
+
+  const keys = [...map.keys()].sort((a, b) => b.length - a.length);
+  let re;
+  try {
+    re = new RegExp(keys.map(escapeRegExp).join('|'), 'g');
+  } catch (e) {
+    return;                       /* 解析失败就整体放弃，别连累整篇渲染 */
+  }
+
+  let budget = 300;               /* 超大代码块时封顶，避免边打字边卡 */
+
+  root.querySelectorAll('code:not(.term-key)').forEach(code => {
+    if (budget <= 0) return;
+
+    const walker = document.createTreeWalker(code, NodeFilter.SHOW_TEXT, null);
+    const texts = [];
+    let node;
+    while ((node = walker.nextNode())) texts.push(node);
+
+    texts.forEach(textNode => {
+      if (budget <= 0) return;
+      const parent = textNode.parentElement;
+      if (parent && parent.closest(KW_SKIP)) return;
+
+      const data = textNode.data;
+      const spots = [];
+      let m;
+      re.lastIndex = 0;
+      while ((m = re.exec(data))) {
+        const s = m.index;
+        const e = s + m[0].length;
+        if (isWordChar(data[s - 1]) || isWordChar(data[e])) continue;
+        spots.push([s, e, m[0]]);
+      }
+      if (!spots.length) return;
+
+      /* 从后往前切，拼成「文字段 / 徽章」交替的片段，最后整块换掉这个文本节点 */
+      const parts = [];
+      let tail = data.length;
+      for (let i = spots.length - 1; i >= 0; i--) {
+        if (spots[i][1] < tail) parts.push({ text: data.slice(spots[i][1], tail), key: null });
+        parts.push({ text: data.slice(spots[i][0], spots[i][1]), key: spots[i][2] });
+        tail = spots[i][0];
+      }
+      if (tail > 0) parts.push({ text: data.slice(0, tail), key: null });
+
+      const frag = document.createDocumentFragment();
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const p = parts[i];
+        if (!p.key) { frag.appendChild(document.createTextNode(p.text)); continue; }
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'kw';
+        btn.dataset.term = p.key;
+        btn.title = p.key + '：' + map.get(p.key).def;
+        btn.textContent = p.text;
+        frag.appendChild(btn);
+        budget--;
+      }
+      textNode.parentNode.replaceChild(frag, textNode);
+    });
+  });
+}
+
+/** 找到真正在滚动的祖先容器（阅读区是 els.main，编辑预览是预览面板本身） */
+function scrollParentOf(el) {
+  let p = el.parentElement;
+  while (p) {
+    const oy = getComputedStyle(p).overflowY;
+    if (oy === 'auto' || oy === 'scroll') return p;
+    p = p.parentElement;
+  }
+  return null;
+}
+
+/** 点击徽章：滚到说明区里那一条并闪一下 */
+function jumpToTerm(root, key) {
+  let target = null;
+  root.querySelectorAll('.term-item').forEach(el => {
+    if (!target && el.dataset.term === key) target = el;
+  });
+  if (!target) return;
+
+  target.classList.remove('is-flash');
+  void target.offsetWidth;        /* 强制重排，让同一处连点也能重新播放动画 */
+  target.classList.add('is-flash');
+  clearTimeout(target.flashTimer);
+  target.flashTimer = setTimeout(() => target.classList.remove('is-flash'), 1200);
+
+  const box = scrollParentOf(target);
+  if (!box) { target.scrollIntoView({ block: 'center', behavior: 'smooth' }); return; }
+
+  const top = target.getBoundingClientRect().top - box.getBoundingClientRect().top + box.scrollTop;
+  box.scrollTo({
+    top: Math.max(0, top - box.clientHeight / 2 + target.offsetHeight / 2),
+    behavior: 'smooth'
+  });
+}
+
 function enhanceCodeBlocks(root) {
   const scope = root || els.markdownBody;
+  const termMap = enhanceTerms(scope);
+
   scope.querySelectorAll('pre').forEach(pre => {
     if (pre.querySelector('.code-copy')) return;
     const btn = document.createElement('button');
@@ -378,9 +558,12 @@ function enhanceCodeBlocks(root) {
 
   if (window.hljs) {
     scope.querySelectorAll('pre code').forEach(el => {
+      if (el.dataset.highlighted) return;   /* 已高亮过的块别重复处理，否则会抹掉徽章 */
       try { hljs.highlightElement(el); } catch (e) { /* 忽略单块失败 */ }
     });
   }
+
+  enhanceKeywords(scope, termMap);
 }
 
 /* 私有仓库里的图片带不上 Authorization 头，必须先取回字节再换成临时地址 */
@@ -1114,6 +1297,14 @@ function bindEvents() {
     if (btn) applyToolAction(btn.dataset.act);
   });
   els.previewToggleBtn.addEventListener('click', togglePreview);
+
+  /* 代码里的关键字徽章：点击跳到说明区对应的条目 */
+  [els.markdownBody, els.editorPreview].forEach(box => {
+    box.addEventListener('click', e => {
+      const kw = e.target.closest('.kw');
+      if (kw) jumpToTerm(box, kw.dataset.term);
+    });
+  });
 
   els.imageInput.addEventListener('change', e => {
     const file = e.target.files && e.target.files[0];
